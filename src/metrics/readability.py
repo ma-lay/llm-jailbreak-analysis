@@ -72,12 +72,19 @@ def readability_score(suffix: str, query: str) -> float:
     total_words = max(1, len(tokens))
     valid_words = sum(1 for t in tokens if re.fullmatch(r"[A-Za-z]+", t) is not None)
     english_ratio = valid_words / total_words
+    unique_ratio = len(set(tokens)) / max(1, total_words)
+
+    # Hard filtering for low-quality text.
+    if english_ratio < 0.7:
+        return 0.0
+
+    if unique_ratio < 0.7:
+        return 0.0
 
     ascii_penalty = 0.85 if any(ord(ch) > 127 for ch in suffix) else 1.0
     symbol_count = len(re.findall(r"[^\w\s]", suffix))
     symbol_ratio = symbol_count / max(1, len(suffix))
     symbol_penalty = 0.8 if symbol_ratio > 0.15 else 1.0
-    unique_ratio = len(set(tokens)) / max(1, total_words)
     if unique_ratio < 0.6:
         repetition_penalty = 0.7
     else:

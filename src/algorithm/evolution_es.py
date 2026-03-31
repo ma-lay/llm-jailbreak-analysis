@@ -210,14 +210,26 @@ def mutation_name(mutation_fn) -> str:
 
 
 def compute_fitness(candidate: Candidate, query: str) -> None:
-    # Calculate weighted fitness score (0.40*attack + 0.30*align + 0.15*read + 0.15*length)
+    # Calculate conditional fitness with success-first optimization.
     del query
-    candidate.fitness = (
-        0.40 * candidate.attack_score
-        + 0.30 * candidate.alignment_score
-        + 0.15 * candidate.read_score
-        + 0.15 * candidate.length_score
-    )
+    if candidate.attack_score < 0.5:
+        # Focus on achieving jailbreak first.
+        candidate.fitness = (
+            0.70 * candidate.attack_score
+            + 0.20 * candidate.alignment_score
+            + 0.10 * candidate.read_score
+        )
+    else:
+        # Once successful, optimize quality.
+        candidate.fitness = (
+            0.40 * candidate.attack_score
+            + 0.30 * candidate.alignment_score
+            + 0.20 * candidate.read_score
+            + 0.10 * candidate.length_score
+        )
+
+    if candidate.attack_score == 0:
+        candidate.fitness *= 0.5
 
 
 class EvolutionStrategy:
@@ -493,15 +505,27 @@ class EvolutionStrategy:
 
         return best_candidate
 
-    def _mutate(self, base: str, query: str) -> tuple:
+    def _mutate(self, parent: Candidate, query: str) -> tuple:
         # Apply one or more mutation operators and return (mutated_text, mutation_type)
+        base = parent.suffix
         text = copy.copy(base)
-        llm_prob = 0.05 + 0.15 * self.current_mutation_rate
+        # Adaptive LLM refinement probability based on readability.
+        parent_read = getattr(parent, "read_score", 0.5)
+        if parent_read < 0.4:
+            llm_prob = 0.5
+        elif parent_read < 0.6:
+            llm_prob = 0.3
+        else:
+            llm_prob = 0.1
 
-        if random.random() < llm_prob:
+        # Prioritize LLM refinement for very low-readability parents.
+        if hasattr(parent, "read_score") and parent.read_score < 0.4:
             mutation_fn = llm_refine_mutation
         else:
-            mutation_fn = random.choice(NON_LLM_MUTATION_FUNCTIONS)
+            if random.random() < llm_prob:
+                mutation_fn = llm_refine_mutation
+            else:
+                mutation_fn = random.choice(NON_LLM_MUTATION_FUNCTIONS)
 
         mutation_type = mutation_name(mutation_fn)
         mutated_text = self._apply_mutation_fn(mutation_fn, text)
@@ -554,7 +578,7 @@ class EvolutionStrategy:
 
             for _ in range(self.lambda_):
                 parent = self._select(parents)
-                child_text, m_type = self._mutate(parent.suffix, query)
+                child_text, m_type = self._mutate(parent, query)
 
                 offspring.append(
                     Candidate(
@@ -569,6 +593,29 @@ class EvolutionStrategy:
             combined_population = parents + offspring
             combined_population.sort(key=lambda c: c.fitness, reverse=True)
             parents = combined_population[: self.mu]
+
+            # Elitist refinement: improve top candidates using LLM.
+            refined_candidates = []
+            top_k = min(2, len(parents))
+
+            for i in range(top_k):
+                c = parents[i]
+                refined_suffix = llm_refine_mutation(c.suffix, self.seed_suffixes, self.model)
+
+                if refined_suffix and refined_suffix != c.suffix:
+                    refined_candidates.append(
+                        Candidate(
+                            suffix=refined_suffix,
+                            generation=gen,
+                            mutation_type="elitist_refine",
+                        )
+                    )
+
+            if refined_candidates:
+                self._evaluate(refined_candidates, query, expected_output)
+                parents.extend(refined_candidates)
+                parents.sort(key=lambda c: c.fitness, reverse=True)
+                parents = parents[: self.mu]
 
             best = parents[0]
 
