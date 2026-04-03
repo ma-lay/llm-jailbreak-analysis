@@ -1,6 +1,6 @@
 """
 Quick setup / smoke test
-Checks: Python version, Ollama reachability, Vicuna availability, imports
+Checks: Python version, Ollama reachability, configured model availability, imports
 """
 
 import sys
@@ -51,7 +51,7 @@ def check_local_modules():
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
     try:
-        from src.model.vicuna_wrapper import VicunaWrapper   # noqa: F401
+        from src.model.ollama_wrapper import OllamaWrapper   # noqa: F401
         from src.algorithm.evolution_es import EvolutionStrategy  # noqa: F401
         from src.metrics.attack_success import is_jailbroken  # noqa: F401
         from src.metrics.readability import readability_score  # noqa: F401

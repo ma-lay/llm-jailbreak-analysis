@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 import config
 from src.algorithm.evolution_es import Candidate, EvolutionStrategy
 from src.metrics.attack_success import attack_success_score, is_jailbroken
-from src.model.vicuna_wrapper import VicunaWrapper
+from src.model.ollama_wrapper import OllamaWrapper
 
 
 def load_queries() -> list[dict]:
@@ -60,7 +60,7 @@ def load_seed_suffixes() -> list[str]:
     return []
 
 
-def baseline_response(model: VicunaWrapper, query: str) -> dict:
+def baseline_response(model: OllamaWrapper, query: str) -> dict:
     """Query without any suffix to get the baseline response."""
     resp = model.generate(query)
     return {
@@ -81,6 +81,7 @@ def format_result_row(
         "timestamp":          datetime.now().isoformat(timespec="seconds"),
         "query_id":           query_row["query_id"],
         "category":           query_row["category"],
+        "model_name":         config.MODEL_NAME,
         "query":              query_row["query"],
         "best_suffix":        best.suffix,
         "fitness":            f"{best.fitness:.4f}",
@@ -196,6 +197,7 @@ def main():
     log(f"Remaining queries: {len(queries)}")
     log(f"Queries         : {len(queries)}")
     log(f"Seed suffixes   : {len(seed_suffixes)}")
+    log(f"Model: {config.MODEL_NAME}")
     log(f"Model           : {config.MODEL_NAME}")
     log(f"Generations     : {config.GENERATIONS}")
     log(f"Parallel workers: {config.PARALLEL_WORKERS}")
@@ -204,7 +206,7 @@ def main():
 
     if not args.dry_run:
         log("Connecting to Ollama...")
-        model = VicunaWrapper()
+        model = OllamaWrapper()
         log(f"Connected - using {config.MODEL_NAME}")
     else:
         model = None

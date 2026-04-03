@@ -1,4 +1,4 @@
-"""Vicuna wrapper via Ollama API"""
+"""Generic Ollama model wrapper."""
 
 import ollama
 import sys
@@ -8,11 +8,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import config
 
 
-class VicunaWrapper:
-    """Interface to Ollama for querying Vicuna 7B."""
+class OllamaWrapper:
+    """Interface to Ollama for a configurable model."""
 
-    def __init__(self, model: str = config.MODEL_NAME):
-        self.model = model
+    def __init__(self, model_name: str = None):
+        self.model_name = model_name or config.MODEL_NAME
         self._verify_connection()
 
     def _verify_connection(self):
@@ -27,7 +27,7 @@ class VicunaWrapper:
     def generate(self, prompt: str, temperature: float = config.TEMPERATURE) -> str:
         """Send prompt and return response."""
         response = ollama.chat(
-            model=self.model,
+            model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": temperature, "num_predict": config.MAX_TOKENS},
         )
@@ -39,6 +39,7 @@ class VicunaWrapper:
         return self.generate(full_prompt)
 
     def generate_suffix_variant(self, base_suffix: str, query: str) -> str:
+        # NOTE: Not used in ES pipeline. Mutation is handled in evolution_es.py
         """Generate new suffix variant similar to base_suffix."""
         max_words = max(5, len(query.split()) // 2)
         prompt = (

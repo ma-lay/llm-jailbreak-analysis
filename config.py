@@ -1,7 +1,8 @@
 """Global configuration for AutoDAN-Evo"""
 
 
-MODEL_NAME       = "vicuna:7b"    # Ollama model tag (use `ollama pull vicuna`)
+# Supported examples: "vicuna", "mistral", "llama2"
+MODEL_NAME       = "vicuna"
 OLLAMA_BASE_URL  = "http://localhost:11434"
 MAX_TOKENS       = 150                # Max response tokens
 TEMPERATURE      = 0.7
