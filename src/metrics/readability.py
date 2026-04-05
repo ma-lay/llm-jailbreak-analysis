@@ -81,6 +81,34 @@ def readability_score(suffix: str, query: str) -> float:
     if unique_ratio < 0.7:
         return 0.0
 
+    # These additional penalties reduce scores for generic, low-information suffixes
+    # while preserving fluency-based readability scoring.
+    stopwords = {"in", "a", "the", "of", "for", "as", "to", "and", "on", "at", "by", "an"}
+
+    content_words = [w for w in tokens if w.lower() not in stopwords]
+    content_ratio = len(content_words) / max(1, len(tokens))
+
+    if content_ratio < 0.5:
+        base_score *= 0.7
+
+    weak_patterns = [
+        "in a",
+        "as a",
+        "for a",
+        "part of",
+        "in the",
+        "on the",
+    ]
+
+    if any(pattern in suffix.lower() for pattern in weak_patterns):
+        base_score *= 0.8
+
+    # Check if suffix contains informative words (length > 4)
+    informative_words = [w for w in tokens if len(w) > 4]
+
+    if len(informative_words) < max(1, len(tokens) // 3):
+        base_score *= 0.75
+
     ascii_penalty = 0.85 if any(ord(ch) > 127 for ch in suffix) else 1.0
     symbol_count = len(re.findall(r"[^\w\s]", suffix))
     symbol_ratio = symbol_count / max(1, len(suffix))
