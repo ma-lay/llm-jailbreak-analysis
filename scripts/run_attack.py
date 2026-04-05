@@ -1,5 +1,6 @@
 import argparse
 import csv
+import re
 import sys
 import time
 from datetime import datetime
@@ -14,7 +15,38 @@ sys.path.insert(0, str(ROOT))
 import config
 from src.algorithm.evolution_es import Candidate, EvolutionStrategy
 from src.metrics.attack_success import attack_success_score, is_jailbroken
+from src.model.llama_wrapper import LlamaWrapper
+from src.model.mistral_wrapper import MistralWrapper
 from src.model.ollama_wrapper import OllamaWrapper
+from src.model.vicuna_wrapper import VicunaWrapper
+
+
+def model_dir_name(model_name: str) -> str:
+    """Return a filesystem-safe directory name for a model label."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(model_name).strip())
+    return cleaned.strip("._") or "unknown_model"
+
+
+def normalize_query_id(value: object) -> str:
+    """Normalize query IDs so resume matching is robust to CSV numeric coercion."""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
+def build_model_wrapper(model_name: str) -> OllamaWrapper:
+    """Pick a model-specific wrapper when possible, else use generic wrapper."""
+    name = str(model_name).strip().lower()
+    if "vicuna" in name:
+        return VicunaWrapper(model_name=model_name)
+    if "mistral" in name:
+        return MistralWrapper(model_name=model_name)
+    if "llama" in name:
+        return LlamaWrapper(model_name=model_name)
+    return OllamaWrapper(model_name=model_name)
 
 
 def load_queries() -> list[dict]:
@@ -125,14 +157,31 @@ def main():
     )
     args = parser.parse_args()
 
+    model_folder = model_dir_name(config.MODEL_NAME)
+    outputs_root = ROOT / "outputs"
+    model_outputs_root = outputs_root / model_folder
+
     if args.resume_run:
         run_id = args.resume_run
-        run_dir = ROOT / "outputs" / run_id
-        if not run_dir.exists():
-            raise FileNotFoundError(f"Resume run directory does not exist: {run_dir}")
+        candidate_dirs = [
+            model_outputs_root / run_id,
+            outputs_root / run_id,
+            outputs_root / model_folder / run_id,
+        ]
+        run_dir = None
+        for candidate in candidate_dirs:
+            if candidate.exists():
+                run_dir = candidate
+                break
+
+        if run_dir is None:
+            raise FileNotFoundError(
+                "Resume run directory does not exist in model-specific or legacy paths. "
+                f"Tried: {', '.join(str(p) for p in candidate_dirs)}"
+            )
     else:
         run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        run_dir = ROOT / "outputs" / run_id
+        run_dir = model_outputs_root / run_id
 
     history_dir = run_dir / "generation_history"
     results_dir = run_dir / "final_results"
@@ -154,7 +203,8 @@ def main():
     seed_suffixes = load_seed_suffixes()
 
     if args.query_id:
-        queries = [q for q in queries if q["query_id"] == args.query_id]
+        requested_id = normalize_query_id(args.query_id)
+        queries = [q for q in queries if normalize_query_id(q["query_id"]) == requested_id]
         if not queries:
             log(f"[!] No query found with id={args.query_id}")
             sys.exit(1)
@@ -169,9 +219,9 @@ def main():
             existing_df = pd.read_csv(outfile)
             if "query_id" in existing_df.columns:
                 completed_query_ids = {
-                    str(x).strip()
+                    normalize_query_id(x)
                     for x in existing_df["query_id"].dropna().tolist()
-                    if str(x).strip() != ""
+                    if normalize_query_id(x) != ""
                 }
             if "best_suffix" in existing_df.columns:
                 existing_best_suffixes = [
@@ -183,7 +233,11 @@ def main():
             log(f"[!] Could not parse existing results for resume: {exc}")
 
     total_before_skip = len(queries)
-    queries = [q for q in queries if q["query_id"] not in completed_query_ids]
+    queries = [
+        q
+        for q in queries
+        if normalize_query_id(q["query_id"]) not in completed_query_ids
+    ]
     skipped_count = total_before_skip - len(queries)
 
     if args.resume_run:
@@ -198,7 +252,6 @@ def main():
     log(f"Remaining queries: {len(queries)}")
     log(f"Queries         : {len(queries)}")
     log(f"Seed suffixes   : {len(seed_suffixes)}")
-    log(f"Model: {config.MODEL_NAME}")
     log(f"Model           : {config.MODEL_NAME}")
     log(f"Generations     : {config.GENERATIONS}")
     log(f"Parallel workers: {config.PARALLEL_WORKERS}")
@@ -207,7 +260,7 @@ def main():
 
     if not args.dry_run:
         log("Connecting to Ollama...")
-        model = OllamaWrapper()
+        model = build_model_wrapper(config.MODEL_NAME)
         log(f"Connected - using {config.MODEL_NAME}")
     else:
         model = None

@@ -53,6 +53,7 @@ def check_local_modules():
     try:
         from src.model.ollama_wrapper import OllamaWrapper   # noqa: F401
         from src.algorithm.evolution_es import EvolutionStrategy  # noqa: F401
+        from src.algorithm.ga import GeneticAlgorithm  # noqa: F401
         from src.metrics.attack_success import is_jailbroken  # noqa: F401
         from src.metrics.readability import readability_score  # noqa: F401
         print("  Local modules … OK")

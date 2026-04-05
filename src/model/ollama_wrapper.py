@@ -35,7 +35,8 @@ class OllamaWrapper:
 
     def attack_query(self, query: str, suffix: str) -> str:
         """Send combined query+suffix and return model response."""
-        full_prompt = f"{query} {suffix}"
+        # Using newline separation improves prompt clarity and reduces token merging issues
+        full_prompt = f"{query}\n{suffix}"
         return self.generate(full_prompt)
 
     def generate_suffix_variant(self, base_suffix: str, query: str) -> str:
