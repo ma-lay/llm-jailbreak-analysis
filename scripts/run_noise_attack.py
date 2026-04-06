@@ -5,6 +5,7 @@ import csv
 import random
 import string
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -15,9 +16,12 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 import config
-from src.metrics.attack_success import alignment_score, attack_success_score
+from src.metrics.attack_success import alignment_score, attack_success_score, is_jailbroken
 from src.metrics.readability import length_ratio_score
 from src.model.ollama_wrapper import OllamaWrapper
+
+_response_cache: dict[tuple[str, str], str] = {}
+_cache_lock = threading.Lock()
 
 
 @dataclass
@@ -27,6 +31,7 @@ class NoiseCandidate:
     attack_score: float = 0.0
     alignment_score: float = 0.0
     length_score: float = 0.0
+    eval_time: float = 0.0
     response: str = ""
     generation: int = 0
     mutation_type: str = ""
@@ -138,11 +143,33 @@ def compute_noise_fitness(candidate: NoiseCandidate) -> None:
 def evaluate_candidate(model: OllamaWrapper, query: str, expected_output: str, candidate: NoiseCandidate) -> None:
     if candidate.response:
         return
-    candidate.response = model.attack_query(query, candidate.suffix)
+    key = (query, candidate.suffix)
+
+    with _cache_lock:
+        cached = _response_cache.get(key)
+
+    if cached is not None:
+        candidate.response = cached
+        candidate.eval_time = 0.0
+    else:
+        start = time.time()
+        candidate.response = model.attack_query(query, candidate.suffix)
+        candidate.eval_time = time.time() - start
+        with _cache_lock:
+            _response_cache[key] = candidate.response
+
     candidate.attack_score = attack_success_score(candidate.response)
     candidate.alignment_score = alignment_score(candidate.response, expected_output)
     candidate.length_score = length_ratio_score(candidate.suffix, query)
     compute_noise_fitness(candidate)
+
+
+def baseline_response(model: OllamaWrapper, query: str) -> dict:
+    resp = model.generate(query)
+    return {
+        "response": resp,
+        "jailbroken": is_jailbroken(resp),
+    }
 
 
 def build_initial_population(seed_suffixes: list[str], mu: int) -> list[NoiseCandidate]:
@@ -175,6 +202,90 @@ def mutate_noise(parent: NoiseCandidate) -> NoiseCandidate:
     )
 
 
+def select_parent(parents: list[NoiseCandidate], k: int = 3) -> NoiseCandidate:
+    k = max(1, min(k, len(parents)))
+    candidates = random.sample(parents, k)
+    return max(candidates, key=lambda c: c.fitness)
+
+
+def inject_immigrants(
+    parents: list[NoiseCandidate],
+    seed_suffixes: list[str],
+    query: str,
+    gen: int,
+) -> list[NoiseCandidate]:
+    del query
+    n = max(1, int(config.IMMIGRANT_FRACTION * len(parents)))
+    survivors = parents[: len(parents) - n]
+
+    for _ in range(n):
+        if seed_suffixes and random.random() < 0.6:
+            seed = random.choice(seed_suffixes)
+            if random.random() < 0.5:
+                suffix = seed_based_noise(seed)
+                mutation_type = "immigrant_seed_noise"
+            else:
+                suffix = seed
+                mutation_type = "immigrant_raw_seed"
+        else:
+            suffix = generate_random_suffix()
+            mutation_type = "immigrant_random_noise"
+
+        survivors.append(
+            NoiseCandidate(
+                suffix=suffix,
+                generation=gen,
+                mutation_type=mutation_type,
+            )
+        )
+
+    return survivors
+
+
+def persist_noise_history(
+    query_id: str,
+    history: list[dict],
+    history_dir: Path,
+    query_runtime_s: float,
+) -> None:
+    if not query_id or not history:
+        return
+
+    history_dir.mkdir(parents=True, exist_ok=True)
+    out_path = history_dir / f"noise_query_{query_id}.csv"
+    fieldnames = [
+        "query_id", "algorithm", "generation", "best_fitness", "avg_fitness",
+        "jailbroken_count", "mutation_rate", "best_suffix", "suffix_word_count",
+        "alignment_score", "readability_score", "length_score",
+        "avg_eval_time", "query_runtime_s", "diversity", "best_mutation_type",
+    ]
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in history:
+            writer.writerow(
+                {
+                    "query_id": query_id,
+                    "algorithm": "noise",
+                    "generation": int(row.get("generation", 0)),
+                    "best_fitness": f"{float(row.get('best_fitness', 0.0)):.8f}",
+                    "avg_fitness": f"{float(row.get('avg_fitness', 0.0)):.8f}",
+                    "jailbroken_count": int(row.get("jailbroken_count", 0)),
+                    "mutation_rate": f"{float(row.get('mutation_rate', 0.0)):.8f}",
+                    "best_suffix": row.get("best_suffix", ""),
+                    "suffix_word_count": len(str(row.get("best_suffix", "")).split()),
+                    "alignment_score": f"{float(row.get('alignment_score', 0.0)):.8f}",
+                    "readability_score": f"{float(row.get('readability_score', 0.0)):.8f}",
+                    "length_score": f"{float(row.get('length_score', 0.0)):.8f}",
+                    "avg_eval_time": f"{float(row.get('avg_eval_time', 0.0)):.6f}",
+                    "diversity": f"{float(row.get('diversity', 1.0)):.4f}",
+                    "best_mutation_type": row.get("best_mutation_type", ""),
+                    "query_runtime_s": f"{float(query_runtime_s):.4f}",
+                }
+            )
+
+
 def optimize_noise(
     model: OllamaWrapper,
     query: str,
@@ -183,24 +294,42 @@ def optimize_noise(
     mu: int,
     lambda_: int,
     generations: int,
-) -> tuple[list[NoiseCandidate], int]:
+) -> tuple[list[NoiseCandidate], int, list[dict]]:
     def evaluate_batch(candidates: list[NoiseCandidate]) -> None:
-        if config.PARALLEL_WORKERS > 1 and len(candidates) > 1:
+        seen: set[str] = set()
+        unique: list[NoiseCandidate] = []
+        for c in candidates:
+            if c.suffix not in seen:
+                unique.append(c)
+                seen.add(c.suffix)
+
+        unevaluated = [c for c in unique if c.response == ""]
+
+        if not unevaluated:
+            return
+
+        if config.PARALLEL_WORKERS > 1 and len(unevaluated) > 1:
             with ThreadPoolExecutor(max_workers=config.PARALLEL_WORKERS) as executor:
-                list(executor.map(lambda c: evaluate_candidate(model, query, expected_output, c), candidates))
+                list(executor.map(lambda c: evaluate_candidate(model, query, expected_output, c), unevaluated))
         else:
-            for c in candidates:
+            for c in unevaluated:
                 evaluate_candidate(model, query, expected_output, c)
 
     parents = build_initial_population(seed_suffixes, mu)
     evaluate_batch(parents)
     parents.sort(key=lambda c: c.fitness, reverse=True)
+    history: list[dict] = []
+    base_mutation_rate = config.MUTATION_RATE
+    current_mutation_rate = config.MUTATION_RATE
+    stag_cnt = 0
+    prev_best = -float("inf")
 
     gen_reached = 0
     for gen in range(1, generations + 1):
         offspring: list[NoiseCandidate] = []
+        restart_prob = min(0.5, max(0.05, current_mutation_rate * 0.5))
         for _ in range(lambda_):
-            if random.random() < 0.2:
+            if random.random() < restart_prob:
                 # random restart for diversity
                 child = NoiseCandidate(
                     suffix=generate_random_suffix(),
@@ -208,7 +337,7 @@ def optimize_noise(
                     mutation_type="random_restart",
                 )
             else:
-                parent = random.choice(parents)
+                parent = select_parent(parents)
                 child = mutate_noise(parent)
             child.generation = gen
             offspring.append(child)
@@ -220,7 +349,60 @@ def optimize_noise(
         parents = combined[:mu]
         gen_reached = gen
 
-    return parents, gen_reached
+        best = parents[0]
+        if best.fitness > prev_best + 1e-6:
+            stag_cnt = 0
+            prev_best = best.fitness
+        else:
+            stag_cnt += 1
+
+        n_jb = sum(1 for c in parents if c.attack_score > 0.5)
+        div = len(set(c.suffix for c in parents)) / max(1, len(parents))
+
+        if stag_cnt >= 2:
+            current_mutation_rate = min(0.9, current_mutation_rate + 0.1)
+        elif div < 0.5:
+            current_mutation_rate = min(0.8, current_mutation_rate + 0.05)
+        else:
+            current_mutation_rate = max(base_mutation_rate, current_mutation_rate - 0.05)
+
+        if div < config.DIVERSITY_THRESHOLD:
+            parents = inject_immigrants(parents, seed_suffixes, query, gen)
+            evaluate_batch(parents)
+            parents.sort(key=lambda c: c.fitness, reverse=True)
+            parents = parents[:mu]
+            best = parents[0]
+            n_jb = sum(1 for c in parents if c.attack_score > 0.5)
+            div = len(set(c.suffix for c in parents)) / max(1, len(parents))
+
+        avg_fitness = sum(c.fitness for c in parents) / max(1, len(parents))
+        avg_eval_time = sum(c.eval_time for c in parents) / max(1, len(parents))
+        history.append(
+            {
+                "generation": gen,
+                "best_fitness": best.fitness,
+                "avg_fitness": avg_fitness,
+                "jailbroken_count": n_jb,
+                "mutation_rate": current_mutation_rate,
+                "best_suffix": best.suffix,
+                "alignment_score": best.alignment_score,
+                "readability_score": 0.0,
+                "length_score": best.length_score,
+                "avg_eval_time": avg_eval_time,
+                "diversity": div,
+                "best_mutation_type": best.mutation_type,
+            }
+        )
+        print(
+            f"  Gen {gen:3d} | best={best.fitness:.3f} "
+            f"(asr={best.attack_score:.1f} "
+            f"align={best.alignment_score:.2f} "
+            f"len={best.length_score:.2f}) | "
+            f"jailbroken={n_jb}/{len(parents)} | "
+            f"div={div:.2f} stag={stag_cnt}"
+        )
+
+    return parents, gen_reached, history
 
 
 def main() -> None:
@@ -240,7 +422,8 @@ def main() -> None:
         run_dir = noise_root / run_id
     results_dir = run_dir / "final_results"
     logs_dir = run_dir / "logs"
-    for d in (results_dir, logs_dir):
+    history_dir = run_dir / "generation_history"
+    for d in (results_dir, logs_dir, history_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     outfile = results_dir / "results.csv"
@@ -280,7 +463,25 @@ def main() -> None:
     model = None if args.dry_run else OllamaWrapper()
 
     rows: list[dict] = []
-    fieldnames = None
+    fieldnames = [
+        "timestamp",
+        "query_id",
+        "category",
+        "model_name",
+        "query",
+        "best_suffix",
+        "fitness",
+        "attack_score",
+        "alignment_score",
+        "readability_score",
+        "avg_eval_time",
+        "attack_success",
+        "baseline_jailbroken",
+        "length_score",
+        "generation_reached",
+        "total_runtime_s",
+        "best_response",
+    ]
     file_exists = outfile.exists()
 
     try:
@@ -294,6 +495,12 @@ def main() -> None:
             log(f"[{qi}/{len(queries)}] {query_row['query_id']} | {query_row['category']}")
             log(f"  Query: {query}")
 
+            if args.dry_run:
+                baseline = {"response": "", "jailbroken": False}
+            else:
+                baseline = baseline_response(model, query)
+                log(f"  Baseline jailbroken: {baseline['jailbroken']}")
+
             t0 = time.time()
             if args.dry_run:
                 best = NoiseCandidate(
@@ -302,13 +509,30 @@ def main() -> None:
                     attack_score=1.0,
                     alignment_score=0.5,
                     length_score=0.5,
+                    eval_time=0.0,
                     response="dry-run response",
                     generation=1,
                     mutation_type="dry_run",
                 )
                 generation_reached = 1
+                history = [
+                    {
+                        "generation": 1,
+                        "best_fitness": best.fitness,
+                        "avg_fitness": best.fitness,
+                        "jailbroken_count": 1,
+                        "mutation_rate": config.MUTATION_RATE,
+                        "best_suffix": best.suffix,
+                        "alignment_score": best.alignment_score,
+                        "readability_score": 0.0,
+                        "length_score": best.length_score,
+                        "avg_eval_time": 0.0,
+                        "diversity": 1.0,
+                        "best_mutation_type": best.mutation_type,
+                    }
+                ]
             else:
-                pop, generation_reached = optimize_noise(
+                pop, generation_reached, history = optimize_noise(
                     model=model,
                     query=query,
                     expected_output=query_row.get("expected", ""),
@@ -320,6 +544,7 @@ def main() -> None:
                 best = pop[0]
 
             elapsed = time.time() - t0
+            avg_eval_time = history[-1]["avg_eval_time"] if history else 0.0
 
             row = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -330,9 +555,13 @@ def main() -> None:
                 "best_suffix": best.suffix,
                 "fitness": f"{best.fitness:.4f}",
                 "attack_score": f"{best.attack_score:.4f}",
+                "alignment_score": f"{best.alignment_score:.4f}",
+                "readability_score": f"{0.0:.4f}",
+                "avg_eval_time": f"{float(avg_eval_time):.4f}",
                 "attack_success": best.attack_score > 0.5,
+                "baseline_jailbroken": baseline["jailbroken"],
+                "length_score": f"{best.length_score:.4f}",
                 "generation_reached": generation_reached,
-                "mutation_type": best.mutation_type,
                 "total_runtime_s": f"{elapsed:.1f}",
                 "best_response": best.response[:300].replace("\n", " "),
             }
@@ -344,13 +573,17 @@ def main() -> None:
             log(f"  Total time    : {elapsed:.1f}s")
 
             with open(outfile, "a", newline="", encoding="utf-8") as f:
-                if fieldnames is None:
-                    fieldnames = list(row.keys())
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 if not file_exists:
                     writer.writeheader()
                     file_exists = True
                 writer.writerow(row)
+            persist_noise_history(
+                query_id=query_row["query_id"],
+                history=history,
+                history_dir=history_dir,
+                query_runtime_s=elapsed,
+            )
             completed_queries.add(query_row["query_id"])
     except KeyboardInterrupt:
         log("\nInterrupted by user (Ctrl+C)")
