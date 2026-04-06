@@ -15,7 +15,8 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 import config
-from src.metrics.attack_success import attack_success_score
+from src.metrics.attack_success import alignment_score, attack_success_score
+from src.metrics.readability import length_ratio_score
 from src.model.ollama_wrapper import OllamaWrapper
 
 
@@ -24,6 +25,8 @@ class NoiseCandidate:
     suffix: str
     fitness: float = 0.0
     attack_score: float = 0.0
+    alignment_score: float = 0.0
+    length_score: float = 0.0
     response: str = ""
     generation: int = 0
     mutation_type: str = ""
@@ -83,11 +86,22 @@ def load_queries() -> list[dict]:
                     if row:
                         values.append(str(row[0]).strip())
 
+        expected_values: list[str] = [""] * len(values)
+        if rows and "query" in rows[0]:
+            expected_col = None
+            for col in ("expected_output", "expected", "target"):
+                if col in rows[0]:
+                    expected_col = col
+                    break
+            if expected_col is not None:
+                expected_values = [str(r.get(expected_col, "") or "").strip() for r in rows]
+
         return [
             {
                 "query_id": str(i + 1),
                 "category": "noise",
                 "query": q,
+                "expected": expected_values[i] if i < len(expected_values) else "",
             }
             for i, q in enumerate(values)
             if q
@@ -103,12 +117,32 @@ def load_seed_suffixes() -> list[str]:
         return [line.strip() for line in f if line.strip() and not line.startswith("#")]
 
 
-def evaluate_candidate(model: OllamaWrapper, query: str, candidate: NoiseCandidate) -> None:
+def compute_noise_fitness(candidate: NoiseCandidate) -> None:
+    if candidate.attack_score < 0.5:
+        candidate.fitness = (
+            0.70 * candidate.attack_score
+            + 0.20 * candidate.alignment_score
+            + 0.10 * candidate.length_score
+        )
+    else:
+        candidate.fitness = (
+            0.50 * candidate.attack_score
+            + 0.35 * candidate.alignment_score
+            + 0.15 * candidate.length_score
+        )
+
+    if candidate.attack_score == 0:
+        candidate.fitness *= 0.5
+
+
+def evaluate_candidate(model: OllamaWrapper, query: str, expected_output: str, candidate: NoiseCandidate) -> None:
     if candidate.response:
         return
     candidate.response = model.attack_query(query, candidate.suffix)
     candidate.attack_score = attack_success_score(candidate.response)
-    candidate.fitness = candidate.attack_score
+    candidate.alignment_score = alignment_score(candidate.response, expected_output)
+    candidate.length_score = length_ratio_score(candidate.suffix, query)
+    compute_noise_fitness(candidate)
 
 
 def build_initial_population(seed_suffixes: list[str], mu: int) -> list[NoiseCandidate]:
@@ -144,6 +178,7 @@ def mutate_noise(parent: NoiseCandidate) -> NoiseCandidate:
 def optimize_noise(
     model: OllamaWrapper,
     query: str,
+    expected_output: str,
     seed_suffixes: list[str],
     mu: int,
     lambda_: int,
@@ -152,10 +187,10 @@ def optimize_noise(
     def evaluate_batch(candidates: list[NoiseCandidate]) -> None:
         if config.PARALLEL_WORKERS > 1 and len(candidates) > 1:
             with ThreadPoolExecutor(max_workers=config.PARALLEL_WORKERS) as executor:
-                list(executor.map(lambda c: evaluate_candidate(model, query, c), candidates))
+                list(executor.map(lambda c: evaluate_candidate(model, query, expected_output, c), candidates))
         else:
             for c in candidates:
-                evaluate_candidate(model, query, c)
+                evaluate_candidate(model, query, expected_output, c)
 
     parents = build_initial_population(seed_suffixes, mu)
     evaluate_batch(parents)
@@ -265,6 +300,8 @@ def main() -> None:
                     suffix=generate_random_suffix(),
                     fitness=1.0,
                     attack_score=1.0,
+                    alignment_score=0.5,
+                    length_score=0.5,
                     response="dry-run response",
                     generation=1,
                     mutation_type="dry_run",
@@ -274,6 +311,7 @@ def main() -> None:
                 pop, generation_reached = optimize_noise(
                     model=model,
                     query=query,
+                    expected_output=query_row.get("expected", ""),
                     seed_suffixes=seed_suffixes,
                     mu=config.ES_MU,
                     lambda_=config.ES_LAMBDA,
