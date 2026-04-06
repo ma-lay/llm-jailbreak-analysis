@@ -6,6 +6,7 @@ import random
 import string
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -148,9 +149,16 @@ def optimize_noise(
     lambda_: int,
     generations: int,
 ) -> tuple[list[NoiseCandidate], int]:
+    def evaluate_batch(candidates: list[NoiseCandidate]) -> None:
+        if config.PARALLEL_WORKERS > 1 and len(candidates) > 1:
+            with ThreadPoolExecutor(max_workers=config.PARALLEL_WORKERS) as executor:
+                list(executor.map(lambda c: evaluate_candidate(model, query, c), candidates))
+        else:
+            for c in candidates:
+                evaluate_candidate(model, query, c)
+
     parents = build_initial_population(seed_suffixes, mu)
-    for c in parents:
-        evaluate_candidate(model, query, c)
+    evaluate_batch(parents)
     parents.sort(key=lambda c: c.fitness, reverse=True)
 
     gen_reached = 0
@@ -168,8 +176,9 @@ def optimize_noise(
                 parent = random.choice(parents)
                 child = mutate_noise(parent)
             child.generation = gen
-            evaluate_candidate(model, query, child)
             offspring.append(child)
+
+        evaluate_batch(offspring)
 
         combined = parents + offspring
         combined.sort(key=lambda c: c.fitness, reverse=True)
