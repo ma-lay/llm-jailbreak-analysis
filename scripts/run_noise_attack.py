@@ -185,8 +185,15 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Skip model calls with dummy values")
     args = parser.parse_args()
 
-    run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir = ROOT / "outputs" / "noise_attack" / run_id
+    noise_root = ROOT / "outputs" / "noise_attack"
+    noise_root.mkdir(parents=True, exist_ok=True)
+    existing_runs = sorted(p for p in noise_root.glob("run_*") if p.is_dir())
+    if existing_runs:
+        run_dir = existing_runs[-1]
+        run_id = run_dir.name
+    else:
+        run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_dir = noise_root / run_id
     results_dir = run_dir / "final_results"
     logs_dir = run_dir / "logs"
     for d in (results_dir, logs_dir):
@@ -209,6 +216,14 @@ def main() -> None:
             raise ValueError(f"No query found for query_id={args.query_id}")
 
     seed_suffixes = load_seed_suffixes()
+    completed_queries: set[str] = set()
+    if outfile.exists():
+        with open(outfile, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                query_id = str(row.get("query_id", "")).strip()
+                if query_id:
+                    completed_queries.add(query_id)
 
     log(f"Run ID          : {run_id}")
     log("Algorithm       : Noise-ES")
@@ -216,6 +231,7 @@ def main() -> None:
     log(f"Seed suffixes   : {len(seed_suffixes)}")
     log(f"Model           : {config.MODEL_NAME}")
     log(f"Generations     : {config.GENERATIONS}")
+    log(f"Resuming run: skipping {len(completed_queries)} completed entries")
 
     model = None if args.dry_run else OllamaWrapper()
 
@@ -224,6 +240,10 @@ def main() -> None:
     file_exists = outfile.exists()
 
     for qi, query_row in enumerate(queries, 1):
+        if query_row["query_id"] in completed_queries:
+            log(f"Skipping query {query_row['query_id']} (already done)")
+            continue
+
         query = query_row["query"]
         log("=" * 60)
         log(f"[{qi}/{len(queries)}] {query_row['query_id']} | {query_row['category']}")
@@ -283,6 +303,7 @@ def main() -> None:
                 writer.writeheader()
                 file_exists = True
             writer.writerow(row)
+        completed_queries.add(query_row["query_id"])
 
     log(f"Results saved to: {outfile}")
 

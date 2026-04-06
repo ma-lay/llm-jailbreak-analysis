@@ -140,12 +140,33 @@ def main() -> None:
     if not suffix_records:
         raise ValueError("No suffixes found for cross-model evaluation")
 
-    out_dir = ROOT / "outputs" / "cross_model_eval" / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    eval_root = ROOT / "outputs" / "cross_model_eval"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    existing_runs = sorted(p for p in eval_root.glob("run_*") if p.is_dir())
+    if existing_runs:
+        out_dir = existing_runs[-1]
+    else:
+        out_dir = eval_root / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = out_dir / "raw_results.csv"
+
+    completed: set[tuple[str, str, str]] = set()
+    if raw_path.exists():
+        with open(raw_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = (
+                    str(row.get("source_model", "")).strip(),
+                    str(row.get("target_model", "")).strip(),
+                    str(row.get("suffix", "")).strip(),
+                )
+                if all(key):
+                    completed.add(key)
 
     log(f"Queries loaded      : {len(queries)}")
     log(f"Suffixes to evaluate: {len(suffix_records)}")
     log(f"Output directory    : {out_dir}")
+    log(f"Resuming run: skipping {len(completed)} completed entries")
 
     target_models = {
         "vicuna": VicunaWrapper(),
@@ -154,6 +175,7 @@ def main() -> None:
     }
 
     raw_rows: list[dict] = []
+    file_exists = raw_path.exists()
     # NOTE:
     # Cache shared across target models to avoid duplicate evaluations
     # for the same (query, suffix) pair.
@@ -166,6 +188,11 @@ def main() -> None:
         log(f"[{index}/{len(suffix_records)}] Evaluating suffix from source={source_model}")
 
         for target_model_name, model in target_models.items():
+            entry_key = (source_model, target_model_name, suffix)
+            if entry_key in completed:
+                log(f"Skipping already completed: {source_model} -> {target_model_name}")
+                continue
+
             def eval_query(query: str) -> float:
                 key = (query, suffix)
                 if key in cache:
@@ -200,19 +227,26 @@ def main() -> None:
                 f"rate={success_rate:.4f}"
             )
 
-    raw_path = out_dir / "raw_results.csv"
-    with open(raw_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["source_model", "target_model", "suffix", "query_count", "success_rate"],
-        )
-        writer.writeheader()
-        writer.writerows(raw_rows)
+            with open(raw_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["source_model", "target_model", "suffix", "query_count", "success_rate"],
+                )
+                if not file_exists:
+                    writer.writeheader()
+                    file_exists = True
+                writer.writerow(raw_rows[-1])
+            completed.add(entry_key)
 
     grouped_rates: dict[tuple[str, str], list[float]] = defaultdict(list)
     source_models: set[str] = set()
     target_model_names: set[str] = set()
-    for row in raw_rows:
+    summary_rows: list[dict] = []
+    if raw_path.exists():
+        with open(raw_path, newline="", encoding="utf-8") as f:
+            summary_rows = list(csv.DictReader(f))
+
+    for row in summary_rows:
         source_model = row["source_model"]
         target_model = row["target_model"]
         success_rate = float(row["success_rate"])

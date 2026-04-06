@@ -21,6 +21,18 @@ from src.model.ollama_wrapper import OllamaWrapper
 from src.model.vicuna_wrapper import VicunaWrapper
 
 
+def resolve_algorithm_from_config():
+    algo = str(getattr(config, "ATTACK_ALGORITHM", "es")).strip().lower()
+    if algo in {"ga", "genetic", "genetic_algorithm"}:
+        from src.algorithm.ga import GeneticAlgorithm
+
+        return GeneticAlgorithm, "GA"
+    return EvolutionStrategy, "ES"
+
+
+ALGORITHM_CLASS, ALGORITHM_NAME = resolve_algorithm_from_config()
+
+
 def model_dir_name(model_name: str) -> str:
     """Return a filesystem-safe directory name for a model label."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(model_name).strip())
@@ -247,7 +259,7 @@ def main():
         log(f"Starting new run: {run_id}")
 
     log(f"Run ID          : {run_id}")
-    log("Algorithm       : ES")
+    log(f"Algorithm       : {ALGORITHM_NAME}")
     log(f"Completed queries: {len(completed_query_ids)}")
     log(f"Remaining queries: {len(queries)}")
     log(f"Queries         : {len(queries)}")
@@ -307,7 +319,7 @@ def main():
                 gen_reached = 1
                 avg_eval_time = 0.0
             else:
-                optimizer = EvolutionStrategy(
+                optimizer = ALGORITHM_CLASS(
                     model,
                     seed_suffixes,
                     mu=config.ES_MU,
