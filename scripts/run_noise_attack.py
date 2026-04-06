@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -67,51 +69,39 @@ def random_flip(s: str) -> str:
 
 
 def load_queries() -> list[dict]:
-    candidates = [
-        ROOT / "data" / "autodan_dataset.csv",
-        ROOT / "data" / "queries.csv",
-    ]
-    for path in candidates:
-        if not path.exists():
+    path = ROOT / "data" / "autodan_dataset.csv"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {path}. Expected a CSV with a 'query' column."
+        )
+
+    df = pd.read_csv(path)
+    if "query" not in df.columns:
+        raise ValueError("autodan_dataset.csv must include a 'query' column")
+
+    expected_col = None
+    for col in ("expected_output", "expected", "target"):
+        if col in df.columns:
+            expected_col = col
+            break
+
+    queries = []
+    for i, row in df.iterrows():
+        q = str(row.get("query", "")).strip()
+        if not q:
             continue
-
-        with open(path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-
-        values: list[str] = []
-        if rows and "query" in rows[0]:
-            values = [str(r.get("query", "")).strip() for r in rows]
-        else:
-            with open(path, newline="", encoding="utf-8") as f:
-                reader2 = csv.reader(f)
-                header = next(reader2, [])
-                _ = header
-                for row in reader2:
-                    if row:
-                        values.append(str(row[0]).strip())
-
-        expected_values: list[str] = [""] * len(values)
-        if rows and "query" in rows[0]:
-            expected_col = None
-            for col in ("expected_output", "expected", "target"):
-                if col in rows[0]:
-                    expected_col = col
-                    break
-            if expected_col is not None:
-                expected_values = [str(r.get(expected_col, "") or "").strip() for r in rows]
-
-        return [
+        expected_value = ""
+        if expected_col is not None and pd.notna(row.get(expected_col)):
+            expected_value = str(row.get(expected_col, "")).strip()
+        queries.append(
             {
                 "query_id": str(i + 1),
                 "category": "noise",
                 "query": q,
-                "expected": expected_values[i] if i < len(expected_values) else "",
+                "expected": expected_value,
             }
-            for i, q in enumerate(values)
-            if q
-        ]
-    raise FileNotFoundError("No query dataset found in data/autodan_dataset.csv or data/queries.csv")
+        )
+    return queries
 
 
 def load_seed_suffixes() -> list[str]:
@@ -455,6 +445,7 @@ def main() -> None:
     log(f"Run ID          : {run_id}")
     log("Algorithm       : Noise-ES")
     log(f"Queries         : {len(queries)}")
+    log(f"Expected targets: {sum(1 for q in queries if str(q.get('expected', '')).strip())}/{len(queries)} non-empty")
     log(f"Seed suffixes   : {len(seed_suffixes)}")
     log(f"Model           : {config.MODEL_NAME}")
     log(f"Generations     : {config.GENERATIONS}")
