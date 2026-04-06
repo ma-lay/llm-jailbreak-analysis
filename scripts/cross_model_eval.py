@@ -181,62 +181,67 @@ def main() -> None:
     # for the same (query, suffix) pair.
     cache: dict[tuple[str, str], float] = {}
 
-    for index, record in enumerate(suffix_records, 1):
-        source_model = record["source_model"]
-        suffix = record["suffix"]
+    try:
+        for index, record in enumerate(suffix_records, 1):
+            source_model = record["source_model"]
+            suffix = record["suffix"]
 
-        log(f"[{index}/{len(suffix_records)}] Evaluating suffix from source={source_model}")
+            log(f"[{index}/{len(suffix_records)}] Evaluating suffix from source={source_model}")
 
-        for target_model_name, model in target_models.items():
-            entry_key = (source_model, target_model_name, suffix)
-            if entry_key in completed:
-                log(f"Skipping already completed: {source_model} -> {target_model_name}")
-                continue
+            for target_model_name, model in target_models.items():
+                entry_key = (source_model, target_model_name, suffix)
+                if entry_key in completed:
+                    log(f"Skipping already completed: {source_model} -> {target_model_name}")
+                    continue
 
-            def eval_query(query: str) -> float:
-                key = (query, suffix)
-                if key in cache:
-                    return cache[key]
-                response = model.attack_query(query, suffix)
-                score = attack_success_score(response)
-                cache[key] = score
-                return score
+                def eval_query(query: str) -> float:
+                    key = (query, suffix)
+                    if key in cache:
+                        return cache[key]
+                    response = model.attack_query(query, suffix)
+                    score = attack_success_score(response)
+                    cache[key] = score
+                    return score
 
-            if config.PARALLEL_WORKERS > 1 and len(queries) > 1:
-                with ThreadPoolExecutor(max_workers=config.PARALLEL_WORKERS) as executor:
-                    results = list(executor.map(eval_query, queries))
-            else:
-                results = [eval_query(query) for query in queries]
+                if config.PARALLEL_WORKERS > 1 and len(queries) > 1:
+                    with ThreadPoolExecutor(max_workers=config.PARALLEL_WORKERS) as executor:
+                        results = list(executor.map(eval_query, queries))
+                else:
+                    results = [eval_query(query) for query in queries]
 
-            success_count = sum(1 for score in results if score > 0.5)
-            success_rate = success_count / max(1, len(queries))
+                success_count = sum(1 for score in results if score > 0.5)
+                success_rate = success_count / max(1, len(queries))
 
-            raw_rows.append(
-                {
-                    "source_model": source_model,
-                    "target_model": target_model_name,
-                    "suffix": suffix,
-                    "query_count": len(queries),
-                    "success_rate": f"{success_rate:.4f}",
-                }
-            )
-
-            log(
-                f"  target={target_model_name:<7} "
-                f"success={success_count}/{len(queries)} "
-                f"rate={success_rate:.4f}"
-            )
-
-            with open(raw_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=["source_model", "target_model", "suffix", "query_count", "success_rate"],
+                raw_rows.append(
+                    {
+                        "source_model": source_model,
+                        "target_model": target_model_name,
+                        "suffix": suffix,
+                        "query_count": len(queries),
+                        "success_rate": f"{success_rate:.4f}",
+                    }
                 )
-                if not file_exists:
-                    writer.writeheader()
-                    file_exists = True
-                writer.writerow(raw_rows[-1])
-            completed.add(entry_key)
+
+                log(
+                    f"  target={target_model_name:<7} "
+                    f"success={success_count}/{len(queries)} "
+                    f"rate={success_rate:.4f}"
+                )
+
+                with open(raw_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(
+                        f,
+                        fieldnames=["source_model", "target_model", "suffix", "query_count", "success_rate"],
+                    )
+                    if not file_exists:
+                        writer.writeheader()
+                        file_exists = True
+                    writer.writerow(raw_rows[-1])
+                completed.add(entry_key)
+    except KeyboardInterrupt:
+        log("\nInterrupted by user (Ctrl+C)")
+        log("Progress saved. Re-run to resume automatically.")
+        return
 
     grouped_rates: dict[tuple[str, str], list[float]] = defaultdict(list)
     source_models: set[str] = set()

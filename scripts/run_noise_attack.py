@@ -248,71 +248,76 @@ def main() -> None:
     fieldnames = None
     file_exists = outfile.exists()
 
-    for qi, query_row in enumerate(queries, 1):
-        if query_row["query_id"] in completed_queries:
-            log(f"Skipping query {query_row['query_id']} (already done)")
-            continue
+    try:
+        for qi, query_row in enumerate(queries, 1):
+            if query_row["query_id"] in completed_queries:
+                log(f"Skipping query {query_row['query_id']} (already done)")
+                continue
 
-        query = query_row["query"]
-        log("=" * 60)
-        log(f"[{qi}/{len(queries)}] {query_row['query_id']} | {query_row['category']}")
-        log(f"  Query: {query}")
+            query = query_row["query"]
+            log("=" * 60)
+            log(f"[{qi}/{len(queries)}] {query_row['query_id']} | {query_row['category']}")
+            log(f"  Query: {query}")
 
-        t0 = time.time()
-        if args.dry_run:
-            best = NoiseCandidate(
-                suffix=generate_random_suffix(),
-                fitness=1.0,
-                attack_score=1.0,
-                response="dry-run response",
-                generation=1,
-                mutation_type="dry_run",
-            )
-            generation_reached = 1
-        else:
-            pop, generation_reached = optimize_noise(
-                model=model,
-                query=query,
-                seed_suffixes=seed_suffixes,
-                mu=config.ES_MU,
-                lambda_=config.ES_LAMBDA,
-                generations=config.GENERATIONS,
-            )
-            best = pop[0]
+            t0 = time.time()
+            if args.dry_run:
+                best = NoiseCandidate(
+                    suffix=generate_random_suffix(),
+                    fitness=1.0,
+                    attack_score=1.0,
+                    response="dry-run response",
+                    generation=1,
+                    mutation_type="dry_run",
+                )
+                generation_reached = 1
+            else:
+                pop, generation_reached = optimize_noise(
+                    model=model,
+                    query=query,
+                    seed_suffixes=seed_suffixes,
+                    mu=config.ES_MU,
+                    lambda_=config.ES_LAMBDA,
+                    generations=config.GENERATIONS,
+                )
+                best = pop[0]
 
-        elapsed = time.time() - t0
+            elapsed = time.time() - t0
 
-        row = {
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "query_id": query_row["query_id"],
-            "category": query_row["category"],
-            "model_name": config.MODEL_NAME,
-            "query": query,
-            "best_suffix": best.suffix,
-            "fitness": f"{best.fitness:.4f}",
-            "attack_score": f"{best.attack_score:.4f}",
-            "attack_success": best.attack_score > 0.5,
-            "generation_reached": generation_reached,
-            "mutation_type": best.mutation_type,
-            "total_runtime_s": f"{elapsed:.1f}",
-            "best_response": best.response[:300].replace("\n", " "),
-        }
-        rows.append(row)
+            row = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "query_id": query_row["query_id"],
+                "category": query_row["category"],
+                "model_name": config.MODEL_NAME,
+                "query": query,
+                "best_suffix": best.suffix,
+                "fitness": f"{best.fitness:.4f}",
+                "attack_score": f"{best.attack_score:.4f}",
+                "attack_success": best.attack_score > 0.5,
+                "generation_reached": generation_reached,
+                "mutation_type": best.mutation_type,
+                "total_runtime_s": f"{elapsed:.1f}",
+                "best_response": best.response[:300].replace("\n", " "),
+            }
+            rows.append(row)
 
-        log(f"  Best suffix   : {best.suffix}")
-        log(f"  Fitness       : {best.fitness:.3f}")
-        log(f"  Attack success: {best.attack_score > 0.5}")
-        log(f"  Total time    : {elapsed:.1f}s")
+            log(f"  Best suffix   : {best.suffix}")
+            log(f"  Fitness       : {best.fitness:.3f}")
+            log(f"  Attack success: {best.attack_score > 0.5}")
+            log(f"  Total time    : {elapsed:.1f}s")
 
-        with open(outfile, "a", newline="", encoding="utf-8") as f:
-            if fieldnames is None:
-                fieldnames = list(row.keys())
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not file_exists:
-                writer.writeheader()
-                file_exists = True
-            writer.writerow(row)
-        completed_queries.add(query_row["query_id"])
+            with open(outfile, "a", newline="", encoding="utf-8") as f:
+                if fieldnames is None:
+                    fieldnames = list(row.keys())
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                    file_exists = True
+                writer.writerow(row)
+            completed_queries.add(query_row["query_id"])
+    except KeyboardInterrupt:
+        log("\nInterrupted by user (Ctrl+C)")
+        log("Progress saved. Re-run to resume automatically.")
+        return
 
     log(f"Results saved to: {outfile}")
 
