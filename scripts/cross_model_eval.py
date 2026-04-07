@@ -149,6 +149,7 @@ def main() -> None:
         out_dir = eval_root / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_path = out_dir / "raw_results.csv"
+    detailed_path = out_dir / "detailed_results.csv"
 
     completed: set[tuple[str, str, str]] = set()
     if raw_path.exists():
@@ -163,6 +164,20 @@ def main() -> None:
                 if all(key):
                     completed.add(key)
 
+    completed_detailed: set[tuple[str, str, str, str]] = set()
+    if detailed_path.exists():
+        with open(detailed_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = (
+                    str(row.get("query_id", "")).strip(),
+                    str(row.get("suffix", "")).strip(),
+                    str(row.get("source_model", "")).strip(),
+                    str(row.get("target_model", "")).strip(),
+                )
+                if all(key):
+                    completed_detailed.add(key)
+
     log(f"Queries loaded      : {len(queries)}")
     log(f"Suffixes to evaluate: {len(suffix_records)}")
     log(f"Output directory    : {out_dir}")
@@ -176,6 +191,7 @@ def main() -> None:
 
     raw_rows: list[dict] = []
     file_exists = raw_path.exists()
+    detailed_file_exists = detailed_path.exists()
     # NOTE:
     # Cache shared across target models to avoid duplicate evaluations
     # for the same (query, suffix) pair.
@@ -222,6 +238,31 @@ def main() -> None:
                     }
                 )
 
+                detailed_rows = []
+                for i, (query, score) in enumerate(zip(queries, results)):
+                    row_key = (
+                        str(i + 1),
+                        suffix,
+                        source_model,
+                        target_model_name,
+                    )
+
+                    if row_key in completed_detailed:
+                        continue
+
+                    detailed_rows.append(
+                        {
+                            "query_id": str(i + 1),
+                            "query": query,
+                            "suffix": suffix,
+                            "source_model": source_model,
+                            "target_model": target_model_name,
+                            "success": int(score > 0.5),
+                        }
+                    )
+
+                    completed_detailed.add(row_key)
+
                 log(
                     f"  target={target_model_name:<7} "
                     f"success={success_count}/{len(queries)} "
@@ -237,6 +278,17 @@ def main() -> None:
                         writer.writeheader()
                         file_exists = True
                     writer.writerow(raw_rows[-1])
+
+                with open(detailed_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(
+                        f,
+                        fieldnames=["query_id", "query", "suffix", "source_model", "target_model", "success"],
+                    )
+                    if not detailed_file_exists:
+                        writer.writeheader()
+                        detailed_file_exists = True
+                    if detailed_rows:
+                        writer.writerows(detailed_rows)
                 completed.add(entry_key)
     except KeyboardInterrupt:
         log("\nInterrupted by user (Ctrl+C)")
