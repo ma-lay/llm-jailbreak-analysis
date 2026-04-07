@@ -67,11 +67,11 @@ def infer_source_model(run_dir: Path, rows: list[dict]) -> str:
 
     name = run_dir.name.lower()
     if "vicuna" in name:
-        return "vicuna"
+        return "vicuna:7b"
     if "mistral" in name:
-        return "mistral"
+        return "mistral:7b"
     if "llama" in name:
-        return "llama2"
+        return "llama2:7b"
     return "unknown"
 
 
@@ -185,9 +185,9 @@ def main() -> None:
     log(f"Resuming run: skipping {len(completed)} completed entries")
 
     target_models = {
-        "vicuna": VicunaWrapper(),
-        "mistral": MistralWrapper(),
-        "llama2": LlamaWrapper(),
+        "vicuna:7b": VicunaWrapper(),
+        "mistral:7b": MistralWrapper(),
+        "llama2:7b": LlamaWrapper(),
     }
 
     raw_rows: list[dict] = []
@@ -213,7 +213,7 @@ def main() -> None:
                     continue
 
                 def eval_query(query: str) -> float:
-                    key = (query, suffix)
+                    key = (query, suffix ,target_model_name)
                     # Thread-safe cache read
                     with cache_lock:
                         if key in cache:
