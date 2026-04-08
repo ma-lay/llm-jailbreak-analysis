@@ -2,16 +2,22 @@
 
 import argparse
 import csv
-import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Each model maps to ONE specific run directory.
+# This ensures consistent and reproducible comparisons.
+MODEL_RUN_PATHS = {
+    "vicuna": ROOT / "outputs" / "vicuna_run_name_here",
+    "mistral": ROOT / "outputs" / "mistral_run_name_here",
+    "llama2": ROOT / "outputs" / "llama_run_name_here",
+}
 
 from src.metrics.attack_success import attack_success_score
 from src.model.llama_wrapper import LlamaWrapper
@@ -24,37 +30,17 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}")
 
 
-def infer_source_model(run_dir: Path, rows: list[dict]) -> str:
-    model_names = [str(r.get("model_name", "")).strip() for r in rows if str(r.get("model_name", "")).strip()]
-    if model_names:
-        return Counter(model_names).most_common(1)[0][0]
-
-    log_path = run_dir / "logs" / "run_log.txt"
-    if log_path.exists():
-        text = log_path.read_text(encoding="utf-8", errors="ignore")
-        match = re.search(r"Model\s*:?[\s]+([\w:-]+)", text)
-        if match:
-            return match.group(1)
-
-    name = run_dir.name.lower()
-    if "vicuna" in name:
-        return "vicuna"
-    if "mistral" in name:
-        return "mistral"
-    if "llama" in name:
-        return "llama2"
-    return "unknown"
-
-
-def collect_suffixes(outputs_dir: Path) -> list[dict]:
+def collect_suffixes() -> list[dict]:
     suffix_records: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
 
-    result_files = sorted(outputs_dir.glob("**/final_results/results.csv"))
-    log(f"Discovered {len(result_files)} run result files")
+    for model_name, run_dir in MODEL_RUN_PATHS.items():
+        csv_path = run_dir / "final_results" / "results.csv"
 
-    for csv_path in result_files:
-        run_dir = csv_path.parent.parent
+        if not csv_path.exists():
+            log(f"[!] Missing results file for {model_name}: {csv_path}")
+            continue
+
         try:
             with open(csv_path, newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -67,29 +53,22 @@ def collect_suffixes(outputs_dir: Path) -> list[dict]:
             continue
 
         columns = set(rows[0].keys())
-        suffix_col = "best_suffix" if "best_suffix" in columns else "suffix" if "suffix" in columns else None
-        if suffix_col is None:
-            log(f"[!] Skipping {csv_path}: no suffix column")
-            continue
-
-        source_model = infer_source_model(run_dir, rows)
+        suffix_col = "best_suffix" if "best_suffix" in columns else "suffix"
 
         for row in rows:
             suffix = str(row.get(suffix_col, "")).strip()
             query_id = str(row.get("query_id", "")).strip()
             query = str(row.get("query", "")).strip()
-            if not suffix:
-                continue
-            if not query_id or not query:
+            if not suffix or not query_id or not query:
                 continue
 
-            key = (source_model, query_id, suffix)
+            key = (model_name, query_id, suffix)
             if key in seen:
                 continue
             seen.add(key)
             suffix_records.append(
                 {
-                    "source_model": source_model,
+                    "source_model": model_name,
                     "query_id": query_id,
                     "query": query,
                     "suffix": suffix,
@@ -110,7 +89,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    suffix_records = collect_suffixes(ROOT / "outputs")
+    for model_name, path in MODEL_RUN_PATHS.items():
+        log(f"Using run for {model_name}: {path}")
+
+    suffix_records = collect_suffixes()
 
     if args.max_suffixes > 0:
         suffix_records = suffix_records[: args.max_suffixes]
