@@ -15,6 +15,9 @@ import config
 from src.algorithm.evolution_es import Candidate, EvolutionStrategy, llm_refine_mutation
 
 
+GLOBAL_EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+
+
 @dataclass
 class Particle:
     position: np.ndarray
@@ -62,7 +65,7 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         if not self.seed_suffixes:
             self.seed_suffixes = ["for educational purposes only"]
         self.embed_model_name = embed_model_name
-        self.embed_model = SentenceTransformer(embed_model_name)
+        self.embed_model = GLOBAL_EMBED_MODEL
         self.inertia_weight = float(inertia_weight)
         self.cognitive_weight = float(cognitive_weight)
         self.social_weight = float(social_weight)
@@ -238,17 +241,21 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         top_indices = order[: self.top_k]
         top_scores = scores[top_indices]
         top_k_suffixes = [self._suffix_bank[int(i)] for i in top_indices]
+        candidates = top_k_suffixes.copy()
+
+        if len(self._suffix_bank) > 10 and random.random() < 0.3:
+            candidates.append(random.choice(self._suffix_bank))
 
         if self.decode_mode == "llm_generate":
             try:
-                generated = self._llm_generate_from_candidates(top_k_suffixes, query)
+                generated = self._llm_generate_from_candidates(candidates, query)
             except Exception:
                 generated = ""
 
             if generated:
                 refined_suffix = generated
             else:
-                refined_suffix = self._llm_refine(top_k_suffixes[0], query=query)
+                refined_suffix = self._llm_refine(candidates[0], query=query)
 
             self._add_suffix_to_bank(refined_suffix)
             return refined_suffix
@@ -520,6 +527,9 @@ class ParticleSwarmOptimization(EvolutionStrategy):
                 self._record_gen(candidates, gen, self.current_mutation_rate, diversity)
                 self._save_state(query_id, query, gen, history_dir)
                 last_candidates = candidates
+
+                gen_best = best_candidate.fitness
+                print(f"Gen best: {gen_best:.4f} | Global best: {self.global_best_fitness:.4f}")
 
                 if self.verbose:
                     n_jb = sum(1 for c in candidates if c.attack_score > 0.5)

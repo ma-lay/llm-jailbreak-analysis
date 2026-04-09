@@ -1,6 +1,6 @@
 """PSO runner that reuses the existing attack pipeline."""
 
-from scripts import run_attack as base_runner
+import run_attack as base_runner
 from src.algorithm.pso import ParticleSwarmOptimization
 
 
