@@ -23,6 +23,10 @@ from src.model.vicuna_wrapper import VicunaWrapper
 
 def resolve_algorithm_from_config():
     algo = str(getattr(config, "ATTACK_ALGORITHM", "es")).strip().lower()
+    if algo in {"pso", "particle_swarm", "particle swarm", "swarm"}:
+        from src.algorithm.pso import ParticleSwarmOptimization
+
+        return ParticleSwarmOptimization, "PSO"
     if algo in {"ga", "genetic", "genetic_algorithm"}:
         from src.algorithm.ga import GeneticAlgorithm
 

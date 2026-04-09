@@ -7,7 +7,7 @@ OLLAMA_BASE_URL  = "http://localhost:11434"
 MAX_TOKENS       = 150                # Max response tokens
 TEMPERATURE      = 0.7
 
-# Attack optimizer: "es" (default) or "ga"
+# Attack optimizer: "es" (default), "ga", or "pso"
 ATTACK_ALGORITHM = "es"
 
 PARALLEL_WORKERS   = 4
