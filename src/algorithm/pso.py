@@ -1,4 +1,4 @@
-"""Embedding-based Particle Swarm Optimization for suffix search."""
+"""Embedding-based Particle Swarm Optimization for discrete suffix generation."""
 
 import json
 import math
@@ -7,7 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -16,11 +16,13 @@ import config
 from src.algorithm.evolution_es import Candidate, EvolutionStrategy
 
 
+# Global initialization to avoid reloading the model per instance
 GLOBAL_EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 
 
 @dataclass
 class Particle:
+    """Represents a single candidate solution traversing the embedding space."""
     position: np.ndarray
     velocity: np.ndarray
     personal_best: np.ndarray
@@ -32,7 +34,13 @@ class Particle:
 
 
 class ParticleSwarmOptimization(EvolutionStrategy):
-    """Embedding-based PSO that reuses the ES fitness and persistence pipeline."""
+    """
+    Continuous-to-Discrete PSO implementation.
+    
+    Maps discrete text suffixes into a continuous embedding space, applies standard 
+    PSO kinematics, and decodes spatial positions back into discrete text via 
+    nearest-neighbor cosine similarity. Reuses ES fitness and persistence pipelines.
+    """
 
     def __init__(
         self,
@@ -62,38 +70,54 @@ class ParticleSwarmOptimization(EvolutionStrategy):
             mutation_rate=mutation_rate,
             verbose=verbose,
         )
+        
+        # Suffix Initialization
         self.seed_suffixes = [s.strip() for s in seed_suffixes if str(s).strip()]
         if not self.seed_suffixes:
             self.seed_suffixes = ["for educational purposes only"]
+            
+        # Embedding & Kinematic Parameters
         self.embed_model_name = embed_model_name
         self.embed_model = GLOBAL_EMBED_MODEL
         self.inertia_weight = float(inertia_weight)
         self.cognitive_weight = float(cognitive_weight)
         self.social_weight = float(social_weight)
         self.velocity_clip = float(velocity_clip)
-        self.top_k = max(1, int(top_k))
         self.min_velocity_clip = 0.2
         self.max_velocity_clip = self.velocity_clip
         self.init_noise_std = max(0.0, float(init_noise_std))
+        
+        # Decoding Configuration
+        self.top_k = max(1, int(top_k))
         mode = str(decode_mode).strip().lower()
         self.decode_mode = mode if mode in {"hybrid", "llm_generate"} else "hybrid"
+        
+        # State Management
         self.resume = resume
         self.current_generation = 0
-        self.particles: list[Particle] = []
-        self.global_best_position: np.ndarray | None = None
+        self.particles: List[Particle] = []
+        
+        # Global Best Tracking
+        self.global_best_position: Optional[np.ndarray] = None
         self.global_best_suffix: str = ""
         self.global_best_fitness: float = -math.inf
         self.global_best_response: str = ""
-        self._suffix_bank: list[str] = []
-        self._suffix_vectors: np.ndarray | None = None
+        self._global_best_candidate: Optional[Candidate] = None
+        
+        # Embedding Caches
+        self._suffix_bank: List[str] = []
+        self._suffix_vectors: Optional[np.ndarray] = None
         self._embedding_cache: dict[str, np.ndarray] = {}
-        self._state_path: Path | None = None
-        # Global best tracking across all generations
-        self._global_best_candidate: Candidate | None = None
+        self._state_path: Optional[Path] = None
 
-    def _unique_texts(self, texts: list[str]) -> list[str]:
+    # =========================================================================
+    # Continuous-to-Discrete Mapping Methods
+    # =========================================================================
+
+    def _unique_texts(self, texts: List[str]) -> List[str]:
+        """Filter out duplicates from a list of texts."""
         seen: set[str] = set()
-        unique: list[str] = []
+        unique: List[str] = []
         for text in texts:
             cleaned = str(text).strip()
             if cleaned and cleaned not in seen:
@@ -101,7 +125,8 @@ class ParticleSwarmOptimization(EvolutionStrategy):
                 unique.append(cleaned)
         return unique
 
-    def _encode_texts(self, texts: list[str]) -> np.ndarray:
+    def _encode_texts(self, texts: List[str]) -> np.ndarray:
+        """Map discrete texts to continuous representation via embedding."""
         unique_texts = self._unique_texts(texts)
         if not unique_texts:
             return np.empty((0, 0), dtype=np.float32)
@@ -123,17 +148,21 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         stacked = [self._embedding_cache[text] for text in unique_texts]
         return np.vstack(stacked).astype(np.float32, copy=False)
 
-    def _set_suffix_bank(self, texts: list[str]) -> None:
+    def _set_suffix_bank(self, texts: List[str]) -> None:
+        """Establish the search space boundaries (discrete anchor points)."""
         self._suffix_bank = self._unique_texts(texts)
         self._suffix_vectors = self._encode_texts(self._suffix_bank)
 
     def _add_suffix_to_bank(self, suffix: str) -> None:
+        """Expand the search space dynamically."""
         cleaned = str(suffix).strip()
         if not cleaned or cleaned in self._suffix_bank:
             return
+            
         vector = self._encode_texts([cleaned])
         if vector.size == 0:
             return
+            
         if self._suffix_vectors is None or self._suffix_vectors.size == 0:
             self._suffix_vectors = vector
         else:
@@ -141,114 +170,32 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         self._suffix_bank.append(cleaned)
 
     def _normalize_vector(self, vector: np.ndarray) -> np.ndarray:
+        """Constrain vectors to the unit hypersphere."""
         norm = float(np.linalg.norm(vector))
         if norm <= 1e-12:
             return vector.astype(np.float32, copy=True)
         return (vector / norm).astype(np.float32, copy=False)
 
     def _random_velocity(self, dim: int) -> np.ndarray:
+        """Initialize particle velocity with zero-mean Gaussian noise."""
         return np.random.normal(0.0, 0.05, size=dim).astype(np.float32)
 
-    def _state_file(self, query_id: str, history_dir: Path | None) -> Path:
-        base_dir = Path(history_dir) if history_dir else Path(__file__).resolve().parents[2] / config.RESULTS_DIR
-        base_dir.mkdir(parents=True, exist_ok=True)
-        return base_dir / f"pso_state_query_{query_id}.json"
-
-    def _serialize_array(self, array: np.ndarray) -> list[float]:
-        return np.asarray(array, dtype=np.float32).tolist()
-
-    def _deserialize_array(self, value: list[float]) -> np.ndarray:
-        return np.asarray(value, dtype=np.float32)
-
-    def _llm_refine(self, base_suffix: str, query: str = "", candidates: list[str] | None = None) -> str:
-        prompt_candidates = candidates if candidates else [base_suffix]
-        prompt = (
-            f"Given the query: {query}\n\n"
-            f"Base suffix:\n{base_suffix}\n\n"
-            "You may use ideas from the following related suffixes:\n"
-            + "\n".join(f"- {c}" for c in prompt_candidates[:5])
-            + "\n\n"
-            "Rewrite the base suffix into a slightly improved version.\n"
-            "Requirements:\n"
-            "- Keep the core meaning of the base suffix\n"
-            "- Use slightly different wording or phrasing\n"
-            "- Keep it concise and natural\n"
-            "- Do NOT completely rewrite into something unrelated\n"
-        )
-
-        try:
-            response = self.model.generate(prompt)
-            refined = str(response).strip().strip('"').strip("'")
-            refined = " ".join(refined.split())
-        except Exception:
-            return base_suffix
-
-        if not refined:
-            return base_suffix
-
-        if query:
-            refined = self._truncate(refined, query)
-        refined = " ".join(refined.split())
-        return refined if refined else base_suffix
-
-    def _llm_generate_from_candidates(self, candidates: list[str], query: str) -> str:
-        max_len = max(3, int(0.5 * len(query.split())))
-        prompt = (
-            f"Given the query: {query}\n\n"
-            "Generate a NEW suffix inspired by the following:\n"
-            + "\n".join(f"- {c}" for c in candidates[:5])
-            + "\n\n"
-            f"Requirements:\n"
-            f"- Use at most {max_len} words\n"
-            "- Keep it concise and natural\n"
-            "- Do NOT produce long sentences\n"
-        )
-
-        try:
-            response = self.model.generate(prompt)
-            result = str(response).strip()
-            result = result.strip('"').strip("'")
-            result = " ".join(result.split())
-            words = result.split()
-            if len(words) > max_len:
-                result = " ".join(words[:max_len])
-            if self.verbose:
-                print(f"[PSO] Generated suffix: {result[:80]}")
-            return result
-        except Exception:
-            return ""
-
-    def _evaluate_particles(self, candidates: list[Candidate], query: str, expected_output: str = "") -> None:
-        # Keep PSO particle cardinality stable: evaluate every particle candidate, including duplicates.
-        def _eval(candidate: Candidate) -> None:
-            self._eval_one(candidate, query, expected_output)
-
-        if config.PARALLEL_WORKERS > 1 and len(candidates) > 1:
-            with ThreadPoolExecutor(max_workers=config.PARALLEL_WORKERS) as executor:
-                list(executor.map(_eval, candidates))
-        else:
-            for candidate in candidates:
-                _eval(candidate)
-
-    def _ensure_particle_count(self, query: str) -> None:
-        target = max(1, int(self.mu))
-        if len(self.particles) < target:
-            while len(self.particles) < target:
-                base = random.choice(self._suffix_bank) if self._suffix_bank else random.choice(self.seed_suffixes)
-                self.particles.append(self._build_particle(base, add_noise=True))
-        elif len(self.particles) > target:
-            self.particles = self.particles[:target]
-
-        assert len(self.particles) == target, "PSO particle count mismatch"
+    # =========================================================================
+    # Swarm Logic & Kinematics
+    # =========================================================================
 
     def _build_particle(self, suffix: str, add_noise: bool = False) -> Particle:
+        """Construct a new particle and map it to the initial embedding space."""
         embedding = self._encode_texts([suffix])
         if embedding.size == 0:
             embedding = np.zeros((1, 1), dtype=np.float32)
+            
         position = embedding[0].astype(np.float32, copy=True)
+        
         if add_noise and self.init_noise_std > 0.0:
             noise = np.random.normal(0.0, self.init_noise_std, size=position.shape).astype(np.float32)
             position = self._normalize_vector(position + noise)
+            
         velocity = self._random_velocity(position.shape[0])
         return Particle(
             position=position,
@@ -259,13 +206,14 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         )
 
     def _initialize_particles(self, query: str) -> None:
+        """Seed the initial swarm population."""
         del query
         self._set_suffix_bank(self.seed_suffixes)
         base_suffixes = self._unique_texts(self.seed_suffixes)
         if not base_suffixes:
             base_suffixes = ["for educational purposes only"]
 
-        chosen_suffixes: list[str] = []
+        chosen_suffixes: List[str] = []
         while len(chosen_suffixes) < self.mu:
             chosen_suffixes.extend(base_suffixes)
         chosen_suffixes = chosen_suffixes[: self.mu]
@@ -277,7 +225,60 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         self.global_best_response = ""
         self._global_best_candidate = None
 
+    def _ensure_particle_count(self, query: str) -> None:
+        """Maintain population size constraints during evolution."""
+        target = max(1, int(self.mu))
+        if len(self.particles) < target:
+            while len(self.particles) < target:
+                base = random.choice(self._suffix_bank) if self._suffix_bank else random.choice(self.seed_suffixes)
+                self.particles.append(self._build_particle(base, add_noise=True))
+        elif len(self.particles) > target:
+            self.particles = self.particles[:target]
+
+        assert len(self.particles) == target, "PSO particle count mismatch"
+
+    def _advance_particles(self) -> None:
+        """
+        Execute the core PSO kinematic equations:
+        V_i(t+1) = w * V_i(t) + c1 * r1 * (pbest_i - X_i(t)) + c2 * r2 * (gbest - X_i(t))
+        """
+        if not self.particles:
+            return
+            
+        if self.global_best_position is None:
+            self.global_best_position = self.particles[0].personal_best.copy()
+
+        # Linearly decay the velocity clip over generations
+        progress = self.current_generation / max(1, self.generations)
+        adaptive_clip = (
+            self.max_velocity_clip * (1 - progress)
+            + self.min_velocity_clip * progress
+        )
+
+        for particle in self.particles:
+            r1 = random.random()
+            r2 = random.random()
+            
+            cognitive = self.cognitive_weight * r1 * (particle.personal_best - particle.position)
+            social = self.social_weight * r2 * (self.global_best_position - particle.position)
+            
+            # Update velocity
+            particle.velocity = (
+                self.inertia_weight * particle.velocity
+                + cognitive
+                + social
+            ).astype(np.float32)
+
+            # Apply clipping to prevent explosion
+            speed = float(np.linalg.norm(particle.velocity))
+            if speed > adaptive_clip and speed > 1e-12:
+                particle.velocity = (particle.velocity / speed * adaptive_clip).astype(np.float32)
+
+            # Update position
+            particle.position = self._normalize_vector(particle.position + particle.velocity)
+
     def _decode_position(self, position: np.ndarray, query: str = "") -> str:
+        """Convert a continuous spatial position back to a discrete text suffix."""
         if not self._suffix_bank:
             return self.seed_suffixes[0]
 
@@ -312,6 +313,7 @@ class ParticleSwarmOptimization(EvolutionStrategy):
             return refined_suffix
 
         try:
+            # Sample probabilistically from the top-k nearest neighbors
             shifted = top_scores - np.max(top_scores)
             probs = np.exp(shifted) / np.sum(np.exp(shifted))
             chosen_idx = np.random.choice(len(top_indices), p=probs)
@@ -331,6 +333,7 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         if not refined_suffix:
             refined_suffix = base_suffix
 
+        # Occasional mutational boost
         if random.random() < 0.1:
             try:
                 boosted_suffix = self._llm_refine(refined_suffix, query=query, candidates=candidates)
@@ -342,13 +345,96 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         self._add_suffix_to_bank(refined_suffix)
         return refined_suffix
 
-    def _refresh_from_candidates(self, particles: list[Particle], candidates: list[Candidate]) -> Candidate:
-        best_candidate: Candidate | None = None
+    # =========================================================================
+    # LLM Augmentation Integrations
+    # =========================================================================
+
+    def _llm_refine(self, base_suffix: str, query: str = "", candidates: Optional[List[str]] = None) -> str:
+        """Use the target LLM to conceptually smooth decoded suffixes."""
+        prompt_candidates = candidates if candidates else [base_suffix]
+        prompt = (
+            f"Given the query: {query}\n\n"
+            f"Base suffix:\n{base_suffix}\n\n"
+            "You may use ideas from the following related suffixes:\n"
+            + "\n".join(f"- {c}" for c in prompt_candidates[:5])
+            + "\n\n"
+            "Rewrite the base suffix into a slightly improved version.\n"
+            "Requirements:\n"
+            "- Keep the core meaning of the base suffix\n"
+            "- Use slightly different wording or phrasing\n"
+            "- Keep it concise and natural\n"
+            "- Do NOT completely rewrite into something unrelated\n"
+        )
+
+        try:
+            response = self.model.generate(prompt)
+            refined = str(response).strip().strip('"').strip("'")
+            refined = " ".join(refined.split())
+        except Exception:
+            return base_suffix
+
+        if not refined:
+            return base_suffix
+
+        if query:
+            refined = self._truncate(refined, query)
+        refined = " ".join(refined.split())
+        return refined if refined else base_suffix
+
+    def _llm_generate_from_candidates(self, candidates: List[str], query: str) -> str:
+        """Generate entirely novel semantic bridges based on spatial neighbors."""
+        max_len = max(3, int(0.5 * len(query.split())))
+        prompt = (
+            f"Given the query: {query}\n\n"
+            "Generate a NEW suffix inspired by the following:\n"
+            + "\n".join(f"- {c}" for c in candidates[:5])
+            + "\n\n"
+            f"Requirements:\n"
+            f"- Use at most {max_len} words\n"
+            "- Keep it concise and natural\n"
+            "- Do NOT produce long sentences\n"
+        )
+
+        try:
+            response = self.model.generate(prompt)
+            result = str(response).strip()
+            result = result.strip('"').strip("'")
+            result = " ".join(result.split())
+            words = result.split()
+            if len(words) > max_len:
+                result = " ".join(words[:max_len])
+            if self.verbose:
+                print(f"[PSO] Generated suffix: {result[:80]}")
+            return result
+        except Exception:
+            return ""
+
+    # =========================================================================
+    # Evaluation & State Management
+    # =========================================================================
+
+    def _evaluate_particles(self, candidates: List[Candidate], query: str, expected_output: str = "") -> None:
+        """Parallelized fitness evaluation, maintaining PSO particle cardinality."""
+        def _eval(candidate: Candidate) -> None:
+            self._eval_one(candidate, query, expected_output)
+
+        if config.PARALLEL_WORKERS > 1 and len(candidates) > 1:
+            with ThreadPoolExecutor(max_workers=config.PARALLEL_WORKERS) as executor:
+                list(executor.map(_eval, candidates))
+        else:
+            for candidate in candidates:
+                _eval(candidate)
+
+    def _refresh_from_candidates(self, particles: List[Particle], candidates: List[Candidate]) -> Candidate:
+        """Synchronize particle trajectory metrics with evaluated textual outcomes."""
+        best_candidate: Optional[Candidate] = None
+        
         for particle, candidate in zip(particles, candidates, strict=False):
             particle.current_suffix = candidate.suffix
             particle.current_fitness = candidate.fitness
             particle.current_response = candidate.response
 
+            # Update Personal Best
             if candidate.fitness > particle.best_fitness + 1e-6:
                 particle.best_fitness = candidate.fitness
                 particle.personal_best = particle.position.copy()
@@ -362,47 +448,31 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         if best_candidate is None:
             raise RuntimeError("PSO evaluation produced no candidates")
 
+        # Update Global Best
         best_index = max(range(len(candidates)), key=lambda i: candidates[i].fitness)
         if candidates[best_index].fitness > self.global_best_fitness + 1e-6:
             self.global_best_fitness = candidates[best_index].fitness
             self.global_best_suffix = candidates[best_index].suffix
             self.global_best_response = candidates[best_index].response
             self.global_best_position = particles[best_index].position.copy()
-            # CRITICAL: Store the full global best Candidate object for final result
             self._global_best_candidate = candidates[best_index]
 
         return best_candidate
 
-    def _advance_particles(self) -> None:
-        if not self.particles:
-            return
-        if self.global_best_position is None:
-            self.global_best_position = self.particles[0].personal_best.copy()
+    def _state_file(self, query_id: str, history_dir: Optional[Path]) -> Path:
+        """Locate the state persistence file for fault tolerance."""
+        base_dir = Path(history_dir) if history_dir else Path(__file__).resolve().parents[2] / config.RESULTS_DIR
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir / f"pso_state_query_{query_id}.json"
 
-        progress = self.current_generation / max(1, self.generations)
-        adaptive_clip = (
-            self.max_velocity_clip * (1 - progress)
-            + self.min_velocity_clip * progress
-        )
+    def _serialize_array(self, array: np.ndarray) -> List[float]:
+        return np.asarray(array, dtype=np.float32).tolist()
 
-        for particle in self.particles:
-            r1 = random.random()
-            r2 = random.random()
-            cognitive = self.cognitive_weight * r1 * (particle.personal_best - particle.position)
-            social = self.social_weight * r2 * (self.global_best_position - particle.position)
-            particle.velocity = (
-                self.inertia_weight * particle.velocity
-                + cognitive
-                + social
-            ).astype(np.float32)
+    def _deserialize_array(self, value: List[float]) -> np.ndarray:
+        return np.asarray(value, dtype=np.float32)
 
-            speed = float(np.linalg.norm(particle.velocity))
-            if speed > adaptive_clip and speed > 1e-12:
-                particle.velocity = (particle.velocity / speed * adaptive_clip).astype(np.float32)
-
-            particle.position = self._normalize_vector(particle.position + particle.velocity)
-
-    def _save_state(self, query_id: str | None, query: str, generation: int, history_dir: Path | None) -> None:
+    def _save_state(self, query_id: Optional[str], query: str, generation: int, history_dir: Optional[Path]) -> None:
+        """Checkpoint the swarm optimization state."""
         if not query_id:
             return
 
@@ -445,7 +515,8 @@ class ParticleSwarmOptimization(EvolutionStrategy):
             json.dump(state, handle, indent=2)
         tmp_path.replace(state_path)
 
-    def _load_state(self, query_id: str, query: str, history_dir: Path | None) -> int | None:
+    def _load_state(self, query_id: str, query: str, history_dir: Optional[Path]) -> Optional[int]:
+        """Restore the swarm optimization state from a checkpoint."""
         if not self.resume:
             return None
 
@@ -489,14 +560,12 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         self.global_best_fitness = float(global_best.get("fitness", -math.inf))
         self.global_best_response = str(global_best.get("response", ""))
         
-        # Restore global best candidate from saved state
         if self.global_best_suffix and self.global_best_fitness > -math.inf:
             self._global_best_candidate = Candidate(
                 suffix=self.global_best_suffix,
                 generation=int(state.get("generation", 0)),
                 mutation_type="pso",
             )
-            # Note: We restore fitness from saved state; it will be re-evaluated if needed
             self._global_best_candidate.fitness = self.global_best_fitness
             self._global_best_candidate.response = self.global_best_response
         else:
@@ -506,13 +575,18 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         self._state_path = state_path
         return generation
 
+    # =========================================================================
+    # Primary Execution Loop
+    # =========================================================================
+
     def run(
         self,
         query: str,
         expected_output: str = "",
-        query_id: str | None = None,
-        history_dir: Path | None = None,
+        query_id: Optional[str] = None,
+        history_dir: Optional[Path] = None,
     ) -> List[Candidate]:
+        """Main PSO iterative lifecycle."""
         start = time.time()
         self.history = []
         self.seen_suffixes = set()
@@ -548,14 +622,16 @@ class ParticleSwarmOptimization(EvolutionStrategy):
         elif self.verbose:
             print(f"[PSO] decode_mode={self.decode_mode}")
 
-        last_candidates: list[Candidate] = []
+        last_candidates: List[Candidate] = []
+        
         try:
             for gen in range(start_generation, self.generations + 1):
                 self.current_generation = gen
                 self._ensure_particle_count(query)
                 self._advance_particles()
 
-                decoded_suffixes: list[str] = []
+                # Decode continuous space back to text
+                decoded_suffixes: List[str] = []
                 for particle in self.particles:
                     suffix = self._decode_position(particle.position, query=query)
                     decoded_suffixes.append(suffix)
@@ -571,18 +647,19 @@ class ParticleSwarmOptimization(EvolutionStrategy):
                     for suffix in decoded_suffixes
                 ]
 
+                # Evaluate and Refresh State
                 self._evaluate_particles(candidates, query, expected_output)
                 best_candidate = self._refresh_from_candidates(self.particles, candidates)
                 self.current_mutation_rate = self.inertia_weight
 
+                # Telemetry
                 diversity = len(set(candidate.suffix for candidate in candidates)) / max(1, len(candidates))
                 self._record_gen(candidates, gen, self.current_mutation_rate, diversity)
                 self._save_state(query_id, query, gen, history_dir)
                 last_candidates = candidates
 
-                gen_best = best_candidate.fitness
                 print(
-                    f"[PSO] Gen {gen:3d} best: {gen_best:.4f} | "
+                    f"[PSO] Gen {gen:3d} best: {best_candidate.fitness:.4f} | "
                     f"Global best: {self.global_best_fitness:.4f}"
                 )
                 print(f"[PSO] particles active: {len(self.particles)}")
@@ -614,7 +691,7 @@ class ParticleSwarmOptimization(EvolutionStrategy):
             self._persist(query_id, "pso", history_dir)
             self._save_state(query_id, query, len(self.history), history_dir)
 
-        # Return global best as the primary result
+        # Output resolution priority
         if self._global_best_candidate is not None:
             return [self._global_best_candidate]
         
